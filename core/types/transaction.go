@@ -627,6 +627,14 @@ func (m Message) Data() []byte           { return m.data }
 func (m Message) AccessList() AccessList { return m.accessList }
 func (m Message) IsFake() bool           { return m.isFake }
 
+type MevBundle struct {
+	Txs               Transactions
+	BlockNumber       *big.Int
+	MinTimestamp      uint64
+	MaxTimestamp      uint64
+	RevertingTxHashes []common.Hash
+}
+
 // copyAddressPtr copies an address.
 func copyAddressPtr(a *common.Address) *common.Address {
 	if a == nil {
