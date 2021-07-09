@@ -102,6 +102,10 @@ func applyTransaction(msg types.Message, config *params.ChainConfig, bc ChainCon
 	if err != nil {
 		return nil, err
 	}
+	// unexpect failed tx.
+	if result.Failed() && msg.NotAllowToFail() {
+		return nil, ErrEdenTxUnexpectFailed
+	}
 
 	// Update the state with pending changes.
 	var root []byte

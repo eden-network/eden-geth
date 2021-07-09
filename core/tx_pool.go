@@ -248,6 +248,8 @@ type TxPool struct {
 	pendingNonces *txNoncer      // Pending state tracking virtual nonces
 	currentMaxGas uint64         // Current gas limit for transaction caps
 
+	eden *Eden
+
 	locals  *accountSet // Set of local transaction to exempt from eviction rules
 	journal *txJournal  // Journal of local transaction to back up to disk
 
@@ -257,6 +259,7 @@ type TxPool struct {
 	mevBundles []types.MevBundle
 	all        *txLookup     // All transactions to allow lookups
 	priced     *txPricedList // All transactions sorted by price
+	edenSlotTxExpectHeight map[common.Hash]uint64
 
 	chainHeadCh     chan ChainHeadEvent
 	chainHeadSub    event.Subscription
@@ -290,6 +293,7 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		pending:         make(map[common.Address]*txList),
 		queue:           make(map[common.Address]*txList),
 		beats:           make(map[common.Address]time.Time),
+		edenSlotTxExpectHeight: make(map[common.Hash]uint64),
 		all:             newTxLookup(),
 		chainHeadCh:     make(chan ChainHeadEvent, chainHeadChanSize),
 		reqResetCh:      make(chan *txpoolResetRequest),
@@ -299,6 +303,7 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		reorgShutdownCh: make(chan struct{}),
 		initDoneCh:      make(chan struct{}),
 		gasPrice:        new(big.Int).SetUint64(config.PriceLimit),
+		eden:            NewEden(chainconfig.ChainID.Uint64()),
 	}
 	pool.locals = newAccountSet(pool.signer)
 	for _, addr := range config.Locals {
@@ -545,7 +550,7 @@ func (pool *TxPool) Pending(enforceTips bool) map[common.Address]types.Transacti
 		// If the miner requests tip enforcement, cap the lists now
 		if enforceTips && !pool.locals.contains(addr) {
 			for i, tx := range txs {
-				if tx.EffectiveGasTipIntCmp(pool.gasPrice, pool.priced.urgent.baseFee) < 0 {
+				if tx.EffectiveGasTipIntCmp(pool.gasPrice, pool.priced.urgent.baseFee) < 0 && !tx.IsEdenSlot() {
 					txs = txs[:i]
 					break
 				}
@@ -696,6 +701,34 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	if tx.Gas() < intrGas {
 		return ErrIntrinsicGas
 	}
+	edenEnable := pool.eden.Enable(pool.eip1559)
+	if edenEnable && tx.FromEdenRpc() {
+		b := pool.chain.CurrentBlock()
+		slotAddress, _ := pool.eden.GetSlotAddress(pool.currentState, b.Time())
+		isSlot := tx.IsEdenSlotByToAddr(slotAddress)
+		if isSlot {
+			// we can set slot flag here, because we will check every tx again at worker.
+			tx.SetSlotTx(true)
+			if tx.FromSendSlotTx() {
+				// expect included in the next block
+				n := b.Number().Uint64() + 1
+				tx.SetExpectHeight(n)
+				pool.edenSlotTxExpectHeight[tx.Hash()] = n
+			}
+		}
+		if tx.WithoutGossipByUser() {
+			staked := pool.eden.GetStakedBalance(pool.currentState, tx.From())
+			// only slot tx and staked account can be private
+			isMinStaked := tx.MinStakeSatisfied(staked)
+			tx.SetPrivate(true)
+			log.Debug("Eden private tx", "hash", tx.Hash(), "isSlot", isSlot, "staked", isMinStaked)
+		}
+	}
+
+	// Drop non-local transactions under our own minimal accepted gas price or tip
+	if !local && tx.GasTipCapIntCmp(pool.gasPrice) < 0 && !tx.IsEdenSlot() {
+		return ErrUnderpriced
+	}
 	return nil
 }
 
@@ -725,7 +758,7 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		return false, err
 	}
 	// If the transaction pool is full, discard underpriced transactions
-	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue {
+	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue && !tx.IsEdenSlot() {
 		// If the new transaction is underpriced, don't accept it
 		if !isLocal && pool.priced.Underpriced(tx) {
 			log.Trace("Discarding underpriced transaction", "hash", hash, "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
@@ -1089,6 +1122,35 @@ func (pool *TxPool) removeTx(hash common.Hash, outofbound bool) {
 		}
 	}
 }
+
+func (pool *TxPool) RemoveEdenSlotTxByHeight(newHeadHeight uint64) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	var removedHash  []common.Hash
+	for hash, height := range pool.edenSlotTxExpectHeight {
+		if height < newHeadHeight {
+			removedHash = append(removedHash, hash)
+		}
+	}
+	for _, hash := range removedHash {
+		pool.removeTx(hash, false)
+		delete(pool.edenSlotTxExpectHeight, hash)
+		log.Debug("Remove Eden slot tx", "hash", hash, "height", newHeadHeight)
+	}
+}
+
+//func (pool *TxPool) RemoveEdenSlotTx(tx *types.Transaction) {
+//	h := tx.Hash()
+//	if !tx.NotAllowedToFail() {
+//		log.Error("Remove Eden slot tx", "hash", h)
+//		return
+//	}
+//	log.Debug("Remove Eden slot tx", "hash", h)
+//	pool.mu.Lock()
+//	defer pool.mu.Unlock()
+//
+//	pool.removeTx(h, false)
+//}
 
 // requestReset requests a pool reset to the new head block.
 // The returned channel is closed when the reset has occurred.

@@ -243,6 +243,14 @@ func (b *EthAPIBackend) SendBundle(ctx context.Context, txs types.Transactions, 
 	return b.eth.txPool.AddMevBundle(txs, big.NewInt(blockNumber.Int64()), minTimestamp, maxTimestamp, revertingTxHashes)
 }
 
+func (b *EthAPIBackend) SendSlotTxs(ctx context.Context, txs types.Transactions) []error {
+	return b.eth.txPool.AddRemotes(txs)
+}
+
+func (b *EthAPIBackend) SendSlotTx(ctx context.Context, tx *types.Transaction) error {
+	return b.eth.txPool.AddRemotes([]*types.Transaction{tx})[0]
+}
+
 func (b *EthAPIBackend) GetPoolTransactions() (types.Transactions, error) {
 	pending := b.eth.txPool.Pending(false)
 	var txs types.Transactions
