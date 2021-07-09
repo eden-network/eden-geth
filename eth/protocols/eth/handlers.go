@@ -454,7 +454,7 @@ func handleGetPooledTransactions66(backend Backend, msg Decoder, peer *Peer) err
 		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 	}
 	hashes, txs := answerGetPooledTransactions(backend, query.GetPooledTransactionsPacket, peer)
-	return peer.ReplyPooledTransactionsRLP(query.RequestId, hashes, txs)
+	return peer.ReplyPooledTransactionsRLP(query.RequestId, hashes, txs, true)
 }
 
 func answerGetPooledTransactions(backend Backend, query GetPooledTransactionsPacket, peer *Peer) ([]common.Hash, []rlp.RawValue) {
@@ -471,6 +471,9 @@ func answerGetPooledTransactions(backend Backend, query GetPooledTransactionsPac
 		// Retrieve the requested transaction, skipping if unknown to us
 		tx := backend.TxPool().Get(hash)
 		if tx == nil {
+			continue
+		}
+		if tx.IsPrivate() {
 			continue
 		}
 		// If known, encode and queue for response packet
