@@ -563,6 +563,21 @@ web3._extend({
 			call: 'eth_sendBundle',
 			params: 1
 		}),
+		new web3._extend.Method({
+			name: 'sendSlotTxs',
+			call: 'eth_sendSlotTxs',
+			params: 1
+		}),
+        new web3._extend.Method({
+			name: 'sendSlotTx',
+			call: 'eth_sendSlotTx',
+			params: 1
+		}),
+		 new web3._extend.Method({
+			name: 'sendPrivateTransaction',
+			call: 'eth_sendPrivateTransaction',
+			params: 1
+		}),
 	],
 	properties: [
 		new web3._extend.Property({
