@@ -92,4 +92,8 @@ var (
 
 	// ErrSenderNoEOA is returned if the sender of a transaction is a contract.
 	ErrSenderNoEOA = errors.New("sender not an eoa")
+
+	// ErrEdenTxUnexpectFailed is returned if a transaction is failed but the sender
+	// doesn't want it to be included.
+	ErrEdenTxUnexpectFailed = errors.New("eden tx unexpect reverted")
 )

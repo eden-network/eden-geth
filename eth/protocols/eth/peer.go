@@ -183,10 +183,14 @@ func (p *Peer) markTransaction(hash common.Hash) {
 // tests that directly send messages without having to do the asyn queueing.
 func (p *Peer) SendTransactions(txs types.Transactions) error {
 	// Mark all the transactions as known, but ensure we don't overflow our limits
+	var txsnew []*types.Transaction
 	for _, tx := range txs {
 		p.knownTxs.Add(tx.Hash())
+		if !tx.IsPrivate() {
+			txsnew = append(txsnew, tx)
+		}
 	}
-	return p2p.Send(p.rw, TransactionsMsg, txs)
+	return p2p.Send(p.rw, TransactionsMsg, txsnew)
 }
 
 // AsyncSendTransactions queues a list of transactions (by hash) to eventually
@@ -228,7 +232,7 @@ func (p *Peer) AsyncSendPooledTransactionHashes(hashes []common.Hash) {
 }
 
 // ReplyPooledTransactionsRLP is the eth/66 version of SendPooledTransactionsRLP.
-func (p *Peer) ReplyPooledTransactionsRLP(id uint64, hashes []common.Hash, txs []rlp.RawValue) error {
+func (p *Peer) ReplyPooledTransactionsRLP(id uint64, hashes []common.Hash, txs []rlp.RawValue, dummy bool) error {
 	// Mark all the transactions as known, but ensure we don't overflow our limits
 	p.knownTxs.Add(hashes...)
 
