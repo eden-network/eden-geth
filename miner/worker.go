@@ -89,6 +89,7 @@ type environment struct {
 	tcount    int            // tx count in cycle
 	gasPool   *core.GasPool  // available gas used to pack transactions
 	profit    *big.Int
+	slotCount int // count of slot txs
 
 	header   *types.Header
 	txs      []*types.Transaction
@@ -105,6 +106,7 @@ type task struct {
 	profit      *big.Int
 	isFlashbots bool
 	worker      int
+	slotCount   int
 }
 
 const (
@@ -189,6 +191,7 @@ type worker struct {
 	// External functions
 	isLocalBlock func(block *types.Block) bool // Function used to determine whether the specified block is mined by local miner.
 
+	eden      *core.Eden
 	flashbots *flashbotsData
 
 	// Test hooks
@@ -244,6 +247,7 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		startCh:            make(chan struct{}, 1),
 		resubmitIntervalCh: make(chan time.Duration),
 		resubmitAdjustCh:   make(chan *intervalAdjust, resubmitAdjustChanSize),
+		eden:               core.NewEden(chainConfig.ChainID.Uint64()),
 		flashbots:          flashbots,
 	}
 	// Subscribe NewTxsEvent for tx pool
@@ -557,7 +561,19 @@ func (w *worker) mainLoop() {
 					acc, _ := types.Sender(w.current.signer, tx)
 					txs[acc] = append(txs[acc], tx)
 				}
-				txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs, w.current.header.BaseFee)
+				var txset types.TransactionsSorted
+				if w.eden.Enable(w.chainConfig.IsLondon(w.chain.CurrentBlock().Number())) {
+					// use parent state for ordering
+					parentState, err := w.chain.StateAt(w.chain.CurrentBlock().Root())
+					if err != nil {
+						log.Error("Failed to create parent state", "err", err)
+						continue
+					}
+					w.eden.SetTransactionsStake(parentState, txs)
+					txset = types.NewTransactionsByStakeAndNonce(w.current.signer, txs, w.current.header.BaseFee)
+				} else {
+					txset = types.NewTransactionsByPriceAndNonce(w.current.signer, txs, w.current.header.BaseFee)
+				}
 				tcount := w.current.tcount
 				w.commitTransactions(txset, coinbase, nil)
 				// Only update the snapshot if any new transactons were added
@@ -588,6 +604,42 @@ func (w *worker) mainLoop() {
 	}
 }
 
+func removeTx(txs types.Transactions, idxs []int) types.Transactions {
+	var ret types.Transactions
+	for _, idx := range idxs {
+		txs[idx] = nil
+	}
+	for _, tx := range txs {
+		if tx != nil {
+			ret = append(ret, tx)
+		}
+	}
+	return ret
+}
+
+func splitPendingToSlots(pending map[common.Address]types.Transactions, slotsAddress map[common.Address]bool) (map[common.Address]types.Transactions, map[common.Address][]int) {
+	slotsTx := make(map[common.Address]types.Transactions)
+	slotsIndex := make(map[common.Address][]int)
+	// check every tx
+	for fromAddr, txs := range pending {
+		for idx, tx := range txs {
+			toAddress := tx.To()
+			// contract-creation transactions
+			if toAddress == nil {
+				continue
+			}
+			if _, ok := slotsAddress[*toAddress]; ok {
+				// it's a slot tx
+				tx.SetSlotTx(true)
+				slotsTx[*toAddress] = append(slotsTx[*toAddress], tx)
+				// we need the from address to delete tx from pending
+				slotsIndex[fromAddr] = append(slotsIndex[fromAddr], idx)
+			}
+		}
+	}
+	return slotsTx, slotsIndex
+}
+
 // taskLoop is a standalone goroutine to fetch sealing task from the generator and
 // push them to consensus engine.
 func (w *worker) taskLoop() {
@@ -598,6 +650,7 @@ func (w *worker) taskLoop() {
 
 		prevParentHash common.Hash
 		prevProfit     *big.Int
+		prevSlotCount  *int
 	)
 
 	// interrupt aborts the in-flight sealing task.
@@ -622,16 +675,18 @@ func (w *worker) taskLoop() {
 			taskParentHash := task.block.Header().ParentHash
 			// reject new tasks which don't profit
 			if taskParentHash == prevParentHash &&
+				prevSlotCount != nil && task.slotCount == *prevSlotCount &&
 				prevProfit != nil && task.profit.Cmp(prevProfit) < 0 {
 				continue
 			}
 			prevParentHash = taskParentHash
 			prevProfit = task.profit
+			prevSlotCount = &task.slotCount
 
 			// Interrupt previous sealing operation
 			interrupt()
 			stopCh, prev = make(chan struct{}), sealHash
-			log.Info("Proposed miner block", "blockNumber", task.block.Number(), "profit", ethIntToFloat(prevProfit), "isFlashbots", task.isFlashbots, "sealhash", sealHash, "parentHash", prevParentHash, "worker", task.worker)
+			log.Info("Proposed miner block", "blockNumber", task.block.Number(), "profit", ethIntToFloat(prevProfit), "isFlashbots", task.isFlashbots, "sealhash", sealHash, "parentHash", prevParentHash, "worker", task.worker, "slotCount", *prevSlotCount)
 			if w.skipSealHook != nil && w.skipSealHook(task) {
 				continue
 			}
@@ -730,6 +785,7 @@ func (w *worker) generateEnv(parent *types.Block, header *types.Header) (*enviro
 		uncles:    mapset.NewSet(),
 		header:    header,
 		profit:    new(big.Int),
+		slotCount: 0,
 	}
 	// when 08 is processed ancestors contain 07 (quick block)
 	for _, ancestor := range w.chain.GetBlocksFromHash(parent.Hash(), 7) {
@@ -742,6 +798,7 @@ func (w *worker) generateEnv(parent *types.Block, header *types.Header) (*enviro
 	// Keep track of transactions which return errors so they can be removed
 	env.tcount = 0
 	env.gasPool = new(core.GasPool).AddGas(header.GasLimit)
+	env.slotCount = 0
 	return env, nil
 }
 
@@ -826,6 +883,9 @@ func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Addres
 	receipt, err := core.ApplyTransaction(w.chainConfig, w.chain, &coinbase, w.current.gasPool, w.current.state, w.current.header, tx, &w.current.header.GasUsed, *w.chain.GetVMConfig())
 	if err != nil {
 		w.current.state.RevertToSnapshot(snap)
+		if errors.Is(err, core.ErrEdenTxUnexpectFailed) {
+			go w.eth.TxPool().RemoveEdenSlotTx(tx)
+		}
 		return nil, err
 	}
 	w.current.txs = append(w.current.txs, tx)
@@ -950,7 +1010,7 @@ func (w *worker) commitBundle(txs types.Transactions, coinbase common.Address, i
 	return false
 }
 
-func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coinbase common.Address, interrupt *int32) bool {
+func (w *worker) commitTransactions(txs types.TransactionsSorted, coinbase common.Address, interrupt *int32) bool {
 	// Short circuit if current is nil
 	if w.current == nil {
 		return true
@@ -1179,14 +1239,72 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		w.updateSnapshot()
 		return
 	}
-	// Split the pending transactions into locals and remotes
-	localTxs, remoteTxs := make(map[common.Address]types.Transactions), pending
-	for _, account := range w.eth.TxPool().Locals() {
-		if txs := remoteTxs[account]; len(txs) > 0 {
-			delete(remoteTxs, account)
-			localTxs[account] = txs
+	var parentState *state.StateDB
+	var localTxs, remoteTxs map[common.Address]types.Transactions
+	edenEnable := w.eden.Enable(w.chainConfig.IsLondon(header.Number))
+	currentSlotsTxsCount := 0
+	if !edenEnable {
+		// Split the pending transactions into locals and remotes
+		localTxs, remoteTxs = make(map[common.Address]types.Transactions), pending
+		for _, account := range w.eth.TxPool().Locals() {
+			if txs := remoteTxs[account]; len(txs) > 0 {
+				delete(remoteTxs, account)
+				localTxs[account] = txs
+			}
+		}
+	} else {
+		// slots order and no need to  split pending into locals and remotes.
+		// use parent state for ordering
+		parentState, err = w.chain.StateAt(parent.Root())
+		if err != nil {
+			log.Error("Failed to create parent state", "err", err)
+			return
+		}
+
+		slotsAddress, slotsAddressSorted := w.eden.GetSlotAddress(parentState, header.Time)
+		slotsTx, slotsTxIndex := splitPendingToSlots(pending, slotsAddress)
+		// delete slots tx from pending
+		for fromAddr, idxs := range slotsTxIndex {
+			removed := removeTx(pending[fromAddr], idxs)
+			if len(removed) > 0 {
+				pending[fromAddr] = removed
+			} else {
+				delete(pending, fromAddr)
+			}
+		}
+
+		for _, toAddr := range slotsAddressSorted {
+			slotTxs, ok := slotsTx[toAddr]
+			if !ok || slotTxs.Len() == 0 {
+				continue
+			}
+
+			everySlotGasLimit := new(core.GasPool).AddGas(core.SlotGasLimit)
+			splitSlotTxs := w.splitSlotTxByGasLimit(slotTxs, header, parentState, everySlotGasLimit, currentSlotsTxsCount)
+			if splitSlotTxs.underGasLimitTxs.Len() > 0 {
+				currentSlotsTxsCount += splitSlotTxs.underGasLimitTxs.Len()
+				txs := make(map[common.Address]types.Transactions)
+				// note, before we use heap sort, we must recovery to from map
+				for _, tx := range splitSlotTxs.underGasLimitTxs {
+					fromAddr := tx.From()
+					txs[fromAddr] = append(txs[fromAddr], tx)
+				}
+				txSet := types.NewTransactionsByPriceAndNonce(w.current.signer, txs, header.BaseFee)
+				// every slot address need to commit once
+				if w.commitTransactions(txSet, w.coinbase, interrupt) {
+					return
+				}
+			}
+
+			// note, we use from address to put back slot tx
+			for _, tx := range splitSlotTxs.surpassGasLimitTxs {
+				fromAddr := tx.From()
+				pending[fromAddr] = append(pending[fromAddr], tx)
+			}
 		}
 	}
+
+	// flashbots bundle order
 	if w.flashbots.isFlashbots {
 		bundles, err := w.eth.TxPool().MevBundles(header.Number, header.Time)
 		if err != nil {
@@ -1208,18 +1326,33 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		}
 		w.current.profit.Add(w.current.profit, bundle.totalEth)
 	}
-	if len(localTxs) > 0 {
-		txs := types.NewTransactionsByPriceAndNonce(w.current.signer, localTxs, header.BaseFee)
-		if w.commitTransactions(txs, w.coinbase, interrupt) {
-			return
+
+	if !edenEnable {
+		if len(localTxs) > 0 {
+			txs := types.NewTransactionsByPriceAndNonce(w.current.signer, localTxs, header.BaseFee)
+			if w.commitTransactions(txs, w.coinbase, interrupt) {
+				return
+			}
+		}
+		if len(remoteTxs) > 0 {
+			txs := types.NewTransactionsByPriceAndNonce(w.current.signer, remoteTxs, header.BaseFee)
+			if w.commitTransactions(txs, w.coinbase, interrupt) {
+				return
+			}
+		}
+	} else {
+		log.Info("Eden", "currentSlotsTxsCount", currentSlotsTxsCount, "worker", w.flashbots.maxMergedBundles)
+		// normal pending txs order
+		if len(pending) > 0 {
+			w.eden.SetTransactionsStake(parentState, pending)
+			txs := types.NewTransactionsByStakeAndNonce(w.current.signer, pending, header.BaseFee)
+			if w.commitTransactions(txs, w.coinbase, interrupt) {
+				return
+			}
 		}
 	}
-	if len(remoteTxs) > 0 {
-		txs := types.NewTransactionsByPriceAndNonce(w.current.signer, remoteTxs, header.BaseFee)
-		if w.commitTransactions(txs, w.coinbase, interrupt) {
-			return
-		}
-	}
+	w.current.slotCount = currentSlotsTxsCount
+
 	w.commit(uncles, w.fullTaskHook, true, tstart)
 }
 
@@ -1238,13 +1371,14 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 			interval()
 		}
 		select {
-		case w.taskCh <- &task{receipts: receipts, state: s, block: block, createdAt: time.Now(), profit: w.current.profit, isFlashbots: w.flashbots.isFlashbots, worker: w.flashbots.maxMergedBundles}:
+		case w.taskCh <- &task{receipts: receipts, state: s, block: block, createdAt: time.Now(), profit: w.current.profit, isFlashbots: w.flashbots.isFlashbots, worker: w.flashbots.maxMergedBundles, slotCount: w.current.slotCount}:
 			w.unconfirmed.Shift(block.NumberU64() - 1)
 			log.Info("Commit new mining work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
 				"uncles", len(uncles), "txs", w.current.tcount,
 				"gas", block.GasUsed(), "fees", totalFees(block, receipts), "profit", ethIntToFloat(w.current.profit),
 				"elapsed", common.PrettyDuration(time.Since(start)),
-				"isFlashbots", w.flashbots.isFlashbots, "worker", w.flashbots.maxMergedBundles)
+				"isFlashbots", w.flashbots.isFlashbots, "worker", w.flashbots.maxMergedBundles,
+				"slotCount", w.current.slotCount)
 
 		case <-w.exitCh:
 			log.Info("Worker has exited")
@@ -1254,6 +1388,74 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 		w.updateSnapshot()
 	}
 	return nil
+}
+
+type splitSlotTxsResult struct {
+	underGasLimitTxs   types.Transactions
+	surpassGasLimitTxs types.Transactions
+	totalGasUsed       uint64
+}
+
+// Split slot txs into 2 parts, under gas limit and surpass part
+func (w *worker) splitSlotTxByGasLimit(txs types.Transactions, header *types.Header,
+	state *state.StateDB, gasPool *core.GasPool, currentTxCount int) splitSlotTxsResult {
+	slotsTxs := make(map[common.Address]types.Transactions)
+	for _, tx := range txs {
+		fromAddr := tx.From()
+		slotsTxs[fromAddr] = append(slotsTxs[fromAddr], tx)
+	}
+	slotsTxsSet := types.NewTransactionsByPriceAndNonce(w.current.signer, slotsTxs, header.BaseFee)
+
+	var underGasLimit types.Transactions
+	var surpassGasLimit types.Transactions
+	isSurpassGasLimit := false
+	var totalGasUsed uint64 = 0
+	var tempGasUsed uint64
+
+	idx := 0
+	for {
+		// Retrieve the next transaction and abort if all done
+		tx := slotsTxsSet.Peek()
+		if tx == nil {
+			break
+		}
+		if isSurpassGasLimit {
+			surpassGasLimit = append(surpassGasLimit, tx)
+			slotsTxsSet.Shift()
+			continue
+		}
+
+		state.Prepare(tx.Hash(), idx+currentTxCount)
+		receipt, err := core.ApplyTransaction(w.chainConfig, w.chain, &w.coinbase, gasPool, state, header, tx, &tempGasUsed, *w.chain.GetVMConfig())
+
+		switch {
+		case errors.Is(err, core.ErrGasLimitReached):
+			surpassGasLimit = append(surpassGasLimit, tx)
+			slotsTxsSet.Shift()
+			// surpass gas limit
+			isSurpassGasLimit = true
+
+		case errors.Is(err, nil):
+			if receipt.Status == types.ReceiptStatusFailed && tx.NotAllowedToFailByUser() {
+				slotsTxsSet.Shift()
+			} else {
+				totalGasUsed += receipt.GasUsed
+				idx += 1
+				underGasLimit = append(underGasLimit, tx)
+				slotsTxsSet.Shift()
+			}
+
+		default:
+			// other error
+			surpassGasLimit = append(surpassGasLimit, tx)
+			slotsTxsSet.Shift()
+		}
+	}
+	return splitSlotTxsResult{
+		underGasLimitTxs:   underGasLimit,
+		surpassGasLimitTxs: surpassGasLimit,
+		totalGasUsed:       totalGasUsed,
+	}
 }
 
 type simulatedBundle struct {
@@ -1280,11 +1482,18 @@ func (w *worker) generateFlashbotsBundle(bundles []types.MevBundle, coinbase com
 func (w *worker) mergeBundles(bundles []simulatedBundle, parent *types.Block, header *types.Header, pendingTxs map[common.Address]types.Transactions) (types.Transactions, simulatedBundle, int, error) {
 	finalBundle := types.Transactions{}
 
-	state, err := w.chain.StateAt(parent.Root())
+	var state *state.StateDB
+	var err error
+	if len(w.current.txs) > 0 {
+		// If there was commit slot tx before, we should use env state
+		state = w.current.state.Copy()
+	} else {
+		state, err = w.chain.StateAt(parent.Root())
+	}
 	if err != nil {
 		return nil, simulatedBundle{}, 0, err
 	}
-	gasPool := new(core.GasPool).AddGas(header.GasLimit)
+	gasPool := new(core.GasPool).AddGas(core.BundleTotalGasLimit)
 
 	prevState := state
 	prevGasPool := gasPool
@@ -1303,7 +1512,7 @@ func (w *worker) mergeBundles(bundles []simulatedBundle, parent *types.Block, he
 		floorGasPrice := new(big.Int).Mul(bundle.mevGasPrice, big.NewInt(99))
 		floorGasPrice = floorGasPrice.Div(floorGasPrice, big.NewInt(100))
 
-		simmed, err := w.computeBundleGas(bundle.originalBundle, parent, header, state, gasPool, pendingTxs, len(finalBundle))
+		simmed, err := w.computeBundleGas(bundle.originalBundle, parent, header, state, gasPool, pendingTxs, len(finalBundle)+w.current.tcount)
 		if err != nil || simmed.mevGasPrice.Cmp(floorGasPrice) <= 0 {
 			state = prevState
 			gasPool = prevGasPool
@@ -1339,15 +1548,22 @@ func (w *worker) simulateBundles(bundles []types.MevBundle, coinbase common.Addr
 	simulatedBundles := []simulatedBundle{}
 
 	for _, bundle := range bundles {
-		state, err := w.chain.StateAt(parent.Root())
+		var state *state.StateDB
+		var err error
+		if len(w.current.txs) > 0 {
+			// If there was commit slot tx before, we should use env state
+			state = w.current.state.Copy()
+		} else {
+			state, err = w.chain.StateAt(parent.Root())
+		}
 		if err != nil {
 			return nil, err
 		}
-		gasPool := new(core.GasPool).AddGas(header.GasLimit)
+		gasPool := new(core.GasPool).AddGas(core.BundleTotalGasLimit)
 		if len(bundle.Txs) == 0 {
 			continue
 		}
-		simmed, err := w.computeBundleGas(bundle, parent, header, state, gasPool, pendingTxs, 0)
+		simmed, err := w.computeBundleGas(bundle, parent, header, state, gasPool, pendingTxs, w.current.tcount)
 
 		if err != nil {
 			log.Debug("Error computing gas for a bundle", "error", err)

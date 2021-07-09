@@ -1896,6 +1896,143 @@ func (s *PublicTransactionPoolAPI) Resend(ctx context.Context, sendArgs Transact
 	return common.Hash{}, fmt.Errorf("transaction %#x not found", matchTx.Hash())
 }
 
+type SendSlotTxsArgs struct {
+	Txs []hexutil.Bytes `json:txs`
+	WithoutGossip *bool `json:withoutGossip`
+	NotAllowedToFail *bool `json:notAllowedToFail`
+}
+
+type SendSlotTxsResult struct {
+	Result string      `json:"result"`
+	Code  string `json:"code,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Data  string `json:"data,omitempty"`
+}
+
+// SendSlotTxs accepts txs and add flags to these txs.
+// These transactions have some priorities,
+// they will be selected and placed at the top of the block when the block is produced.
+func (s *PublicTransactionPoolAPI) SendSlotTxs(ctx context.Context, args SendSlotTxsArgs) ([]*SendSlotTxsResult, error) {
+	var txs types.Transactions
+	if len(args.Txs) == 0 {
+		return nil, fmt.Errorf("slot missing txs")
+	}
+	for i, encodedTx := range args.Txs {
+		tx := new(types.Transaction)
+		if err := tx.UnmarshalBinary(encodedTx); err != nil {
+			return nil, fmt.Errorf("%s at %d", err.Error(), i)
+		}
+		txs = append(txs, tx)
+	}
+	tmpTrue := true
+	if args.WithoutGossip == nil {
+		args.WithoutGossip = &tmpTrue
+	}
+	if args.NotAllowedToFail == nil {
+		args.NotAllowedToFail = &tmpTrue
+	}
+	for _, tx := range txs {
+		tx.SetFromEdenRpc(true)
+		if *args.WithoutGossip {
+			tx.SetWithoutGossipByUser(true)
+		}
+		if *args.NotAllowedToFail {
+			tx.SetNotAllowedToFailByUser(true)
+		}
+	}
+	hashes, errs := s.SubmitRemoteTxs(ctx, txs)
+	var results []*SendSlotTxsResult
+	for i, e := range errs {
+		if e == nil {
+			results = append(results, &SendSlotTxsResult{hashes[i].String(), "", "", ""})
+		} else {
+			results = append(results, &SendSlotTxsResult{"error", "-32000", e.Error(), args.Txs[i].String()})
+		}
+	}
+	return results, nil
+}
+
+// SubmitRemoteTxs is a helper function that submits remote txs to txPool and logs a message.
+func (s *PublicTransactionPoolAPI) SubmitRemoteTxs(ctx context.Context, txs types.Transactions) ([]common.Hash, []error) {
+	var hashes = make([]common.Hash, len(txs))
+	var errs = make([]error, len(txs))
+	b := s.b
+	for i, tx := range txs {
+		// If the transaction fee cap is already specified, ensure the
+		// fee of the given transaction is _reasonable_.
+		if err := checkTxFee(tx.GasPrice(), tx.Gas(), b.RPCTxFeeCap()); err != nil {
+			errs[i] =  err
+		}
+		if !b.UnprotectedAllowed() && !tx.Protected() {
+			// Ensure only eip155 signed transactions are submitted if EIP155Required is set.
+			err := errors.New("only replay-protected (EIP-155) transactions allowed over RPC")
+			errs[i] =  err
+		}
+
+		// Print a log with full tx details for manual investigations and interventions
+		signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number())
+		_, err := types.Sender(signer, tx)
+		if err != nil {
+			errs[i] =  err
+		}
+	}
+
+	txPoolErrs := b.SendSlotTxs(ctx, txs)
+	for i, err := range txPoolErrs {
+		if err != nil && errs[i] == nil {
+			errs[i] = err
+		}
+	}
+	for i, err := range errs {
+		if err == nil {
+			hashes[i] = txs[i].Hash()
+		}
+	}
+
+	return hashes, errs
+}
+
+type SendSlotTxArgs struct {
+	Tx hexutil.Bytes `json:txs`
+	WithoutGossip *bool `json:withoutGossip`
+	NotAllowedToFail *bool `json:notAllowedToFail`
+}
+
+// SendSlotTx accepts only one tx and add flags to these txs.
+// This transaction has some priorities,
+// and it will be selected and placed at the top of the block when the block is produced.
+func (s *PublicTransactionPoolAPI) SendSlotTx(ctx context.Context, args SendSlotTxArgs) (common.Hash, error) {
+	if len(args.Tx) == 0 {
+		return common.Hash{}, errors.New("slot missing tx")
+	}
+	tx := new(types.Transaction)
+	if err := tx.UnmarshalBinary(args.Tx); err != nil {
+		return common.Hash{}, err
+	}
+
+	tmpTrue := true
+	if args.WithoutGossip == nil {
+		args.WithoutGossip = &tmpTrue
+	}
+	if args.NotAllowedToFail == nil {
+		args.NotAllowedToFail = &tmpTrue
+	}
+	tx.SetFromEdenRpc(true)
+	if *args.WithoutGossip {
+		tx.SetWithoutGossipByUser(true)
+	}
+	if *args.NotAllowedToFail {
+		tx.SetNotAllowedToFailByUser(true)
+	}
+
+	hashes, errs := s.SubmitRemoteTxs(ctx, []*types.Transaction{tx})
+	if errs[0] == nil {
+		return hashes[0], nil
+	} else {
+		return common.Hash{}, errs[0]
+	}
+}
+
 // PublicDebugAPI is the collection of Ethereum APIs exposed over the public
 // debugging endpoint.
 type PublicDebugAPI struct {
