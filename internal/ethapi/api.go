@@ -1994,8 +1994,6 @@ func (s *PublicTransactionPoolAPI) SubmitRemoteTxs(ctx context.Context, txs type
 
 type SendSlotTxArgs struct {
 	Tx hexutil.Bytes `json:txs`
-	WithoutGossip *bool `json:withoutGossip`
-	NotAllowedToFail *bool `json:notAllowedToFail`
 }
 
 // SendSlotTx accepts only one tx and add flags to these txs.
@@ -2010,20 +2008,37 @@ func (s *PublicTransactionPoolAPI) SendSlotTx(ctx context.Context, args SendSlot
 		return common.Hash{}, err
 	}
 
-	tmpTrue := true
-	if args.WithoutGossip == nil {
-		args.WithoutGossip = &tmpTrue
-	}
-	if args.NotAllowedToFail == nil {
-		args.NotAllowedToFail = &tmpTrue
-	}
+
 	tx.SetFromEdenRpc(true)
-	if *args.WithoutGossip {
-		tx.SetWithoutGossipByUser(true)
+	tx.SetFromSendSlotTx(true)
+	tx.SetWithoutGossipByUser(true)
+	tx.SetNotAllowedToFailByUser(true)
+
+	hashes, errs := s.SubmitRemoteTxs(ctx, []*types.Transaction{tx})
+	if errs[0] == nil {
+		return hashes[0], nil
+	} else {
+		return common.Hash{}, errs[0]
 	}
-	if *args.NotAllowedToFail {
-		tx.SetNotAllowedToFailByUser(true)
+}
+
+type privateTxArgs struct {
+	Tx hexutil.Bytes `json:txs`
+}
+
+// SendPrivateTransaction accepted tx will not broadcast
+func (s *PublicTransactionPoolAPI) SendPrivateTransaction(ctx context.Context, args privateTxArgs) (common.Hash, error) {
+	if len(args.Tx) == 0 {
+		return common.Hash{}, errors.New("missing tx")
 	}
+	tx := new(types.Transaction)
+	if err := tx.UnmarshalBinary(args.Tx); err != nil {
+		return common.Hash{}, err
+	}
+
+
+	tx.SetFromEdenRpc(true)
+	tx.SetPrivate(true)
 
 	hashes, errs := s.SubmitRemoteTxs(ctx, []*types.Transaction{tx})
 	if errs[0] == nil {

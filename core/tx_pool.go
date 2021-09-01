@@ -259,6 +259,7 @@ type TxPool struct {
 	mevBundles []types.MevBundle
 	all        *txLookup     // All transactions to allow lookups
 	priced     *txPricedList // All transactions sorted by price
+	edenSlotTxExpectHeight map[common.Hash]uint64
 
 	chainHeadCh     chan ChainHeadEvent
 	chainHeadSub    event.Subscription
@@ -292,6 +293,7 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		pending:         make(map[common.Address]*txList),
 		queue:           make(map[common.Address]*txList),
 		beats:           make(map[common.Address]time.Time),
+		edenSlotTxExpectHeight: make(map[common.Hash]uint64),
 		all:             newTxLookup(),
 		chainHeadCh:     make(chan ChainHeadEvent, chainHeadChanSize),
 		reqResetCh:      make(chan *txpoolResetRequest),
@@ -697,11 +699,18 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	}
 	edenEnable := pool.eden.Enable(pool.eip1559)
 	if edenEnable && tx.FromEdenRpc() {
-		slotAddress, _ := pool.eden.GetSlotAddress(pool.currentState, pool.chain.CurrentBlock().Time())
+		b := pool.chain.CurrentBlock()
+		slotAddress, _ := pool.eden.GetSlotAddress(pool.currentState, b.Time())
 		isSlot := tx.IsEdenSlotByToAddr(slotAddress)
 		if isSlot {
 			// we can set slot flag here, because we will check every tx again at worker.
 			tx.SetSlotTx(true)
+			if tx.FromSendSlotTx() {
+				// expect included in the next block
+				n := b.Number().Uint64() + 1
+				tx.SetExpectHeight(n)
+				pool.edenSlotTxExpectHeight[tx.Hash()] = n
+			}
 		}
 		if tx.WithoutGossipByUser() {
 			staked := pool.eden.GetStakedBalance(pool.currentState, tx.From())
@@ -1112,18 +1121,34 @@ func (pool *TxPool) removeTx(hash common.Hash, outofbound bool) {
 	}
 }
 
-func (pool *TxPool) RemoveEdenSlotTx(tx *types.Transaction) {
-	h := tx.Hash()
-	if !tx.NotAllowedToFail() {
-		log.Error("Remove Eden slot tx", "hash", h)
-		return
-	}
-	log.Debug("Remove Eden slot tx", "hash", h)
+func (pool *TxPool) RemoveEdenSlotTxByHeight(newHeadHeight uint64) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
-
-	pool.removeTx(h, false)
+	var removedHash  []common.Hash
+	for hash, height := range pool.edenSlotTxExpectHeight {
+		if height < newHeadHeight {
+			removedHash = append(removedHash, hash)
+		}
+	}
+	for _, hash := range removedHash {
+		pool.removeTx(hash, false)
+		delete(pool.edenSlotTxExpectHeight, hash)
+		log.Debug("Remove Eden slot tx", "hash", hash, "height", newHeadHeight)
+	}
 }
+
+//func (pool *TxPool) RemoveEdenSlotTx(tx *types.Transaction) {
+//	h := tx.Hash()
+//	if !tx.NotAllowedToFail() {
+//		log.Error("Remove Eden slot tx", "hash", h)
+//		return
+//	}
+//	log.Debug("Remove Eden slot tx", "hash", h)
+//	pool.mu.Lock()
+//	defer pool.mu.Unlock()
+//
+//	pool.removeTx(h, false)
+//}
 
 // requestReset requests a pool reset to the new head block.
 // The returned channel is closed when the reset has occurred.

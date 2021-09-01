@@ -66,12 +66,14 @@ type Transaction struct {
 	from atomic.Value
 	// eden user flag
 	fromEdenRpc int32
+	fromSendSlotTx int32
 	notAllowedToFailByUser int32
 	withoutGossipByUser int32
 	// eden priority
 	stake atomic.Value
 	private int32
 	slotTx int32
+	expectHeight uint64
 }
 
 // NewTx creates a new transaction.
@@ -389,6 +391,18 @@ func (tx *Transaction) FromEdenRpc() bool {
 	return v == 1
 }
 
+func (tx *Transaction) SetFromSendSlotTx(val bool) {
+	if val {
+		atomic.StoreInt32(&tx.fromSendSlotTx, 1)
+	} else {
+		atomic.StoreInt32(&tx.fromSendSlotTx, 0)
+	}
+}
+func (tx *Transaction) FromSendSlotTx() bool {
+	v := atomic.LoadInt32(&tx.fromSendSlotTx)
+	return v == 1
+}
+
 func (tx *Transaction) SetSlotTx(val bool) {
 	if val {
 		atomic.StoreInt32(&tx.slotTx, 1)
@@ -400,6 +414,14 @@ func (tx *Transaction) SetSlotTx(val bool) {
 func (tx *Transaction) IsEdenSlot() bool {
 	v := atomic.LoadInt32(&tx.slotTx)
 	return v == 1
+}
+
+func (tx *Transaction) SetExpectHeight(height uint64) {
+	atomic.StoreUint64(&tx.expectHeight, height)
+}
+
+func (tx *Transaction) ExpectHeight() uint64 {
+	return atomic.LoadUint64(&tx.expectHeight)
 }
 
 func (tx *Transaction) NotAllowedToFail() bool {

@@ -872,6 +872,125 @@ func (w *worker) updateSnapshot() {
 	w.snapshotState = w.current.state.Copy()
 }
 
+func (w *worker) executeTransaction(state *state.StateDB, header *types.Header, gasPool *core.GasPool, tx *types.Transaction) ([]*types.Log, error) {
+	snap := state.Snapshot()
+	var tempGasUsed uint64
+
+	_, err := tx.EffectiveGasTip(header.BaseFee)
+	if err != nil {
+		return nil, err
+	}
+
+	receipt, err := core.ApplyTransaction(w.chainConfig, w.chain, &w.coinbase, gasPool, state, header, tx, &tempGasUsed, *w.chain.GetVMConfig())
+	if err != nil {
+		state.RevertToSnapshot(snap)
+		return nil, err
+	}
+
+	return receipt.Logs, nil
+}
+
+func (w *worker) computeTransactionsGas(txs types.TransactionsSorted, interrupt *int32) (types.Transactions, bool) {
+	var result types.Transactions
+
+	availableGas := w.current.gasPool.Gas()
+	// 10% gas buffer
+	gasLimitWithBuffer := availableGas + availableGas / 10
+	gasPool := new(core.GasPool).AddGas(gasLimitWithBuffer)
+	gasLimit := w.current.header.GasLimit + w.current.header.GasLimit / 10
+
+	header := types.CopyHeader(w.current.header)
+	//header.GasLimit = gasLimitWithBuffer
+
+	tmpState := w.current.state.Copy()
+	tcount := w.current.tcount
+
+	for {
+		// In the following three cases, we will interrupt the execution of the transaction.
+		// (1) new head block event arrival, the interrupt signal is 1
+		// (2) worker start or restart, the interrupt signal is 1
+		// (3) worker recreate the mining block with any newly arrived transactions, the interrupt signal is 2.
+		// For the first two cases, the semi-finished work will be discarded.
+		// For the third case, the semi-finished work will be submitted to the consensus engine.
+		if interrupt != nil && atomic.LoadInt32(interrupt) != commitInterruptNone {
+			// Notify resubmit loop to increase resubmitting interval due to too frequent commits.
+			if atomic.LoadInt32(interrupt) == commitInterruptResubmit {
+				ratio := float64(gasLimit-gasPool.Gas()) / float64(gasLimit)
+				if ratio < 0.1 {
+					ratio = 0.1
+				}
+				w.resubmitAdjustCh <- &intervalAdjust{
+					ratio: ratio,
+					inc:   true,
+				}
+			}
+			return result, atomic.LoadInt32(interrupt) == commitInterruptNewHead
+		}
+
+		// If we don't have enough gas for any further transactions then we're done
+		if gasPool.Gas() < params.TxGas {
+			log.Trace("Not enough gas for further transactions", "have", gasPool, "want", params.TxGas)
+			break
+		}
+		// Retrieve the next transaction and abort if all done
+		tx := txs.Peek()
+		if tx == nil {
+			break
+		}
+		// Error may be ignored here. The error has already been checked
+		// during transaction acceptance is the transaction pool.
+		//
+		// We use the eip155 signer regardless of the current hf.
+		from, _ := types.Sender(w.current.signer, tx)
+		// Check whether the tx is replay protected. If we're not in the EIP155 hf
+		// phase, start ignoring the sender until we do.
+		if tx.Protected() && !w.chainConfig.IsEIP155(w.current.header.Number) {
+			log.Trace("Ignoring reply protected transaction", "hash", tx.Hash(), "eip155", w.chainConfig.EIP155Block)
+
+			txs.Pop()
+			continue
+		}
+		// Start executing the transaction
+		tmpState.Prepare(tx.Hash(), tcount)
+
+		_, err := w.executeTransaction(tmpState, header, gasPool, tx)
+		switch {
+		case errors.Is(err, core.ErrGasLimitReached):
+			// Pop the current out-of-gas transaction without shifting in the next from the account
+			log.Trace("Gas limit exceeded for current block", "sender", from)
+			txs.Pop()
+
+		case errors.Is(err, core.ErrNonceTooLow):
+			// New head notification data race between the transaction pool and miner, shift
+			log.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
+			txs.Shift()
+
+		case errors.Is(err, core.ErrNonceTooHigh):
+			// Reorg notification data race between the transaction pool and miner, skip account =
+			log.Trace("Skipping account with hight nonce", "sender", from, "nonce", tx.Nonce())
+			txs.Pop()
+
+		case errors.Is(err, nil):
+			// Everything ok, collect the logs and shift in the next transaction from the same account
+			tcount++
+			result = append(result, tx)
+			txs.Shift()
+
+		case errors.Is(err, core.ErrTxTypeNotSupported):
+			// Pop the unsupported transaction without shifting in the next from the account
+			log.Trace("Skipping unsupported transaction type", "sender", from, "type", tx.Type())
+			txs.Pop()
+
+		default:
+			// Strange error, discard the transaction and get the next in line (note, the
+			// nonce-too-high clause will prevent us from executing in vain).
+			log.Debug("Transaction failed, account skipped", "hash", tx.Hash(), "err", err)
+			txs.Shift()
+		}
+	}
+	return result, false
+}
+
 func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Address) ([]*types.Log, error) {
 	snap := w.current.state.Snapshot()
 
@@ -883,9 +1002,6 @@ func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Addres
 	receipt, err := core.ApplyTransaction(w.chainConfig, w.chain, &coinbase, w.current.gasPool, w.current.state, w.current.header, tx, &w.current.header.GasUsed, *w.chain.GetVMConfig())
 	if err != nil {
 		w.current.state.RevertToSnapshot(snap)
-		if errors.Is(err, core.ErrEdenTxUnexpectFailed) {
-			go w.eth.TxPool().RemoveEdenSlotTx(tx)
-		}
 		return nil, err
 	}
 	w.current.txs = append(w.current.txs, tx)
@@ -1222,6 +1338,7 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		w.commit(uncles, nil, false, tstart)
 	}
 
+	w.eth.TxPool().RemoveEdenSlotTxByHeight(header.Number.Uint64())
 	// Fill the block with all available pending transactions.
 	pending, err := w.eth.TxPool().Pending(true)
 	if err != nil {
@@ -1239,6 +1356,7 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		w.updateSnapshot()
 		return
 	}
+	log.Debug("Eden", "worker", w.flashbots.maxMergedBundles, "before slot elapsed", common.PrettyDuration(time.Since(tstart)))
 	var parentState *state.StateDB
 	var localTxs, remoteTxs map[common.Address]types.Transactions
 	edenEnable := w.eden.Enable(w.chainConfig.IsLondon(header.Number))
@@ -1304,6 +1422,7 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		}
 	}
 
+	log.Debug("Eden", "worker", w.flashbots.maxMergedBundles, "before bundle elapsed", common.PrettyDuration(time.Since(tstart)))
 	// flashbots bundle order
 	if w.flashbots.isFlashbots {
 		bundles, err := w.eth.TxPool().MevBundles(header.Number, header.Time)
@@ -1341,12 +1460,30 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 			}
 		}
 	} else {
-		log.Info("Eden", "currentSlotsTxsCount", currentSlotsTxsCount, "worker", w.flashbots.maxMergedBundles)
 		// normal pending txs order
-		if len(pending) > 0 {
-			w.eden.SetTransactionsStake(parentState, pending)
-			txs := types.NewTransactionsByStakeAndNonce(w.current.signer, pending, header.BaseFee)
-			if w.commitTransactions(txs, w.coinbase, interrupt) {
+		pendingLen := len(pending)
+		log.Info("Eden", "worker", w.flashbots.maxMergedBundles, "slot", currentSlotsTxsCount, "slot+bundle", w.current.tcount,
+			"pending", pendingLen, "before staked elapsed", common.PrettyDuration(time.Since(tstart)))
+		if pendingLen > 0 {
+			beforeComputeGas := time.Now()
+			txsByPrice := types.NewTransactionsByPriceAndNonce(w.current.signer, pending, header.BaseFee)
+			nextBlockTxs, haveErr := w.computeTransactionsGas(txsByPrice, interrupt)
+			if haveErr {
+				log.Debug("Eden", "computeTransactionsGas hasErr", true)
+				return
+			}
+			log.Info("Eden", "worker", w.flashbots.maxMergedBundles, "next block txs from pending", len(nextBlockTxs),
+				"used time", common.PrettyDuration(time.Since(beforeComputeGas)))
+
+			pendingReal := make(map[common.Address]types.Transactions, len(nextBlockTxs))
+			for _, tx := range nextBlockTxs {
+				from := tx.From()
+				pendingReal[from] = append(pendingReal[from], tx)
+			}
+
+			w.eden.SetTransactionsStake(parentState, pendingReal)
+			txsByStake := types.NewTransactionsByStakeAndNonce(w.current.signer, pendingReal, header.BaseFee)
+			if w.commitTransactions(txsByStake, w.coinbase, interrupt) {
 				return
 			}
 		}
@@ -1371,7 +1508,7 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 			interval()
 		}
 		select {
-		case w.taskCh <- &task{receipts: receipts, state: s, block: block, createdAt: time.Now(), profit: w.current.profit, isFlashbots: w.flashbots.isFlashbots, worker: w.flashbots.maxMergedBundles, slotCount: w.current.slotCount}:
+		case w.taskCh <- &task{receipts: receipts, state: s, block: block, createdAt: time.Now(), profit: new(big.Int).Set(w.current.profit), isFlashbots: w.flashbots.isFlashbots, worker: w.flashbots.maxMergedBundles, slotCount: w.current.slotCount}:
 			w.unconfirmed.Shift(block.NumberU64() - 1)
 			log.Info("Commit new mining work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
 				"uncles", len(uncles), "txs", w.current.tcount,
