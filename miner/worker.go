@@ -27,6 +27,7 @@ import (
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core"
@@ -642,6 +643,9 @@ func (w *worker) taskLoop() {
 		prevParentHash common.Hash
 		prevProfit     *big.Int
 		prevSlotCount  *int
+
+		prevTime          mclock.AbsTime
+		switchesThisBlock int64
 	)
 
 	// interrupt aborts the in-flight sealing task.
@@ -664,6 +668,12 @@ func (w *worker) taskLoop() {
 			}
 
 			taskParentHash := task.block.Header().ParentHash
+
+			if taskParentHash != prevParentHash {
+				taskSwitchPerBlock.Update(switchesThisBlock)
+				switchesThisBlock = 0
+			}
+
 			// reject new tasks which don't profit
 			if taskParentHash == prevParentHash &&
 				prevSlotCount != nil && task.slotCount == *prevSlotCount &&
@@ -688,6 +698,18 @@ func (w *worker) taskLoop() {
 			if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil {
 				log.Warn("Block sealing failed", "err", err)
 			}
+
+			if prevTime == 0 {
+				prevTime = mclock.Now()
+			} else {
+				now := mclock.Now()
+				taskActiveTimer.Update(time.Duration(now - prevTime))
+				prevTime = now
+			}
+			switchesThisBlock += 1
+			taskSwitches.Inc(1)
+			taskFlashbotsWorker.Update(int64(task.worker))
+			taskEdenSlotTxsInBlock.Update(int64(*prevSlotCount))
 		case <-w.exitCh:
 			interrupt()
 			return
@@ -885,9 +907,9 @@ func (w *worker) computeTransactionsGas(txs types.TransactionsSorted, interrupt 
 
 	availableGas := w.current.gasPool.Gas()
 	// 10% gas buffer
-	gasLimitWithBuffer := availableGas + availableGas / 10
+	gasLimitWithBuffer := availableGas + availableGas/10
 	gasPool := new(core.GasPool).AddGas(gasLimitWithBuffer)
-	gasLimit := w.current.header.GasLimit + w.current.header.GasLimit / 10
+	gasLimit := w.current.header.GasLimit + w.current.header.GasLimit/10
 
 	header := types.CopyHeader(w.current.header)
 	//header.GasLimit = gasLimitWithBuffer
