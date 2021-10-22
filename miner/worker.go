@@ -1340,11 +1340,7 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 
 	w.eth.TxPool().RemoveEdenSlotTxByHeight(header.Number.Uint64())
 	// Fill the block with all available pending transactions.
-	pending, err := w.eth.TxPool().Pending(true)
-	if err != nil {
-		log.Error("Failed to fetch pending transactions", "err", err)
-		return
-	}
+	pending := w.eth.TxPool().Pending(true)
 	// Short circuit if there is no available pending transactions or bundles.
 	// But if we disable empty precommit already, ignore it. Since
 	// empty block is necessary to keep the liveness of the network.
