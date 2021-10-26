@@ -716,10 +716,8 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 			staked := pool.eden.GetStakedBalance(pool.currentState, tx.From())
 			// only slot tx and staked account can be private
 			isMinStaked := tx.MinStakeSatisfied(staked)
-			if isSlot || isMinStaked {
-				tx.SetPrivate(true)
-				log.Debug("Eden private tx", "hash", tx.Hash(), "isSlot", isSlot, "staked", isMinStaked)
-			}
+			tx.SetPrivate(true)
+			log.Debug("Eden private tx", "hash", tx.Hash(), "isSlot", isSlot, "staked", isMinStaked)
 		}
 	}
 
