@@ -47,8 +47,7 @@ const (
 	DynamicFeeTxType
 )
 
-// user must stake more than 100 EDEN to enter the third priority
-const minEdenStaked = 100
+const minEdenStaked = 0
 var minStaked *big.Int
 func init() {
 	minEdenAmount := big.NewInt(minEdenStaked)
@@ -714,6 +713,13 @@ func (s TxByStakeAndTime) Less(i, j int) bool {
 	if iStaked.Cmp(minStaked) >= 0 && jStaked.Cmp(minStaked) >= 0{
 		cmp := iStaked.Cmp(jStaked)
 		if cmp == 0 {
+			if minEdenStaked == 0 {
+				cmp = s[i].minerFee.Cmp(s[j].minerFee)
+				if cmp == 0 {
+					return s[i].tx.time.Before(s[j].tx.time)
+				}
+				return cmp > 0
+			}
 			return s[i].tx.time.Before(s[j].tx.time)
 		}
 		return cmp > 0
