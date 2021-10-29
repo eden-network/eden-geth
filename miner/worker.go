@@ -263,7 +263,11 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		recommit = minRecommitInterval
 	}
 
-	worker.wg.Add(4)
+	if !flashbots.isFlashbots {
+		worker.wg.Add(4)
+	} else {
+		worker.wg.Add(2)
+	}
 	go worker.mainLoop()
 	go worker.newWorkLoop(recommit)
 	if !flashbots.isFlashbots {
