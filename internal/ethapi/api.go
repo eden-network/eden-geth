@@ -1908,9 +1908,9 @@ func (s *PublicTransactionPoolAPI) Resend(ctx context.Context, sendArgs Transact
 }
 
 type SendSlotTxsArgs struct {
-	Txs []hexutil.Bytes `json:txs`
-	WithoutGossip *bool `json:withoutGossip`
-	NotAllowedToFail *bool `json:notAllowedToFail`
+	Txs []hexutil.Bytes `json:"txs"`
+	WithoutGossip *bool `json:"withoutGossip"`
+	NotAllowedToFail *bool `json:"notAllowedToFail"`
 }
 
 type SendSlotTxsResult struct {
@@ -2004,7 +2004,7 @@ func (s *PublicTransactionPoolAPI) SubmitRemoteTxs(ctx context.Context, txs type
 }
 
 type SendSlotTxArgs struct {
-	Tx hexutil.Bytes `json:txs`
+	Tx hexutil.Bytes `json:"tx"`
 }
 
 // SendSlotTx accepts only one tx and add flags to these txs.
@@ -2034,7 +2034,7 @@ func (s *PublicTransactionPoolAPI) SendSlotTx(ctx context.Context, args SendSlot
 }
 
 type privateTxArgs struct {
-	Tx hexutil.Bytes `json:txs`
+	Tx hexutil.Bytes `json:"tx"`
 }
 
 // SendPrivateTransaction accepted tx will not broadcast

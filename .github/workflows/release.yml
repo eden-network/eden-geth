@@ -1,0 +1,81 @@
+name: Release CI
+
+on:
+  push:
+    branches:
+      - "release/v*.*.*eden*.*.*"
+
+jobs:
+  deploy:
+    strategy:
+      matrix:
+        os: [ubuntu-18.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.13
+        id: go
+      
+      - name: Check Out Repo 
+        uses: actions/checkout@v2
+      
+      - name: Prepare
+        id: prep
+        run: |
+          VERSION=${GITHUB_REF#refs/heads/release/v}
+          DOCKER_IMAGE=edennetwork/eden-geth
+          TAGS="${DOCKER_IMAGE}:v${VERSION},${DOCKER_IMAGE}:latest"
+          echo ::set-output name=tags::${TAGS}
+          echo ::set-output name=version::${VERSION}
+      
+      - name: Test
+        run: go test ./core ./miner/... ./internal/ethapi/... ./les/...
+
+      # Condition to only run this whenever the runner os is Ubuntu
+      - name: Build Release Linux
+        if: matrix.os == 'ubuntu-18.04'
+        run: |
+          make geth
+          mkdir -p release
+          mv build/bin/geth ./release/geth
+          mv COPYING ./release/COPYING
+          tar -zcvf eden-geth-linux-amd64-${{ steps.prep.outputs.version }}.tar.gz ./release/
+       
+      # This will draft a new release & will attach the binaries produced by the above outputs.
+      # You still need to publish this release though after job ends.
+      - name: Create Release Draft
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.prep.outputs.version }}
+          target_commitish: ${{ github.ref }}
+          draft: true
+          files: |
+            ./*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # You don't need to add this in secrets it's by default.
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+      
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build and Push Docker Image
+        id: docker_build
+        uses: docker/build-push-action@v2
+        with:
+          context: ./
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.prep.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image Digest
+        run: echo ${{ steps.docker_build.outputs.digest }}
