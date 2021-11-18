@@ -1,0 +1,51 @@
+name: Release CI
+
+on:
+  push:
+    branches:
+      - "release/v*.*.*eden*.*.*"
+
+jobs:
+  deploy:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.13
+        id: go
+      
+      - name: Check Out Repo 
+        uses: actions/checkout@v2
+      
+      - name: Test
+        run: go test ./core ./miner/... ./internal/ethapi/... ./les/...
+
+      - name: Build
+        run: make geth
+
+      # Condition to only run this whenever the runner os is Ubuntu
+      - name: Build Release Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          make geth
+          mkdir -p release
+          mv build/bin/geth ./release/geth
+          mv COPYING ./release/COPYING
+          tar -czvf ./release/eden-geth-linux-amd64-${GITHUB_REF#refs/tags/v}.tar.gz ./release
+       
+      # This will draft a new release & will attach the binaries produced by the above outputs.
+      # You still need to publish this release though after job ends.
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: ${{ github.ref }}
+          draft: true
+          files: |
+            ./release/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # You don't need to add this in secrets it's by default.
