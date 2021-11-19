@@ -2,6 +2,8 @@ name: Go
 
 on:
   push:
+   branches-ignore: 
+    - "release/v*.*.*eden*.*.*"
   pull_request:
     branches: [ master ]
 
