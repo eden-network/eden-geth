@@ -26,7 +26,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/heads/release/v}
           DOCKER_IMAGE=edennetwork/eden-geth
-          TAGS="${DOCKER_IMAGE}:${VERSION},${DOCKER_IMAGE}:latest"
+          TAGS="${DOCKER_IMAGE}:v${VERSION},${DOCKER_IMAGE}:latest"
           echo ::set-output name=tags::${TAGS}
           echo ::set-output name=version::${VERSION}
       
