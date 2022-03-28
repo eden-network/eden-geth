@@ -1909,6 +1909,156 @@ func (s *PublicTransactionPoolAPI) Resend(ctx context.Context, sendArgs Transact
 	return common.Hash{}, fmt.Errorf("transaction %#x not found", matchTx.Hash())
 }
 
+type SendSlotTxsArgs struct {
+	Txs              []hexutil.Bytes `json:"txs"`
+	WithoutGossip    *bool           `json:"withoutGossip"`
+	NotAllowedToFail *bool           `json:"notAllowedToFail"`
+}
+
+type SendSlotTxsResult struct {
+	Result  string `json:"result"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+	Data    string `json:"data,omitempty"`
+}
+
+// SendSlotTxs accepts txs and add flags to these txs.
+// These transactions have some priorities,
+// they will be selected and placed at the top of the block when the block is produced.
+func (s *PublicTransactionPoolAPI) SendSlotTxs(ctx context.Context, args SendSlotTxsArgs) ([]*SendSlotTxsResult, error) {
+	var txs types.Transactions
+	if len(args.Txs) == 0 {
+		return nil, fmt.Errorf("slot missing txs")
+	}
+	for i, encodedTx := range args.Txs {
+		tx := new(types.Transaction)
+		if err := tx.UnmarshalBinary(encodedTx); err != nil {
+			return nil, fmt.Errorf("%s at %d", err.Error(), i)
+		}
+		txs = append(txs, tx)
+	}
+	tmpTrue := true
+	if args.WithoutGossip == nil {
+		args.WithoutGossip = &tmpTrue
+	}
+	if args.NotAllowedToFail == nil {
+		args.NotAllowedToFail = &tmpTrue
+	}
+	for _, tx := range txs {
+		tx.SetFromEdenRpc(true)
+		if *args.WithoutGossip {
+			tx.SetWithoutGossipByUser(true)
+		}
+		if *args.NotAllowedToFail {
+			tx.SetNotAllowedToFailByUser(true)
+		}
+	}
+	hashes, errs := s.SubmitRemoteTxs(ctx, txs)
+	var results []*SendSlotTxsResult
+	for i, e := range errs {
+		if e == nil {
+			results = append(results, &SendSlotTxsResult{hashes[i].String(), "", "", ""})
+		} else {
+			results = append(results, &SendSlotTxsResult{"error", "-32000", e.Error(), args.Txs[i].String()})
+		}
+	}
+	return results, nil
+}
+
+// SubmitRemoteTxs is a helper function that submits remote txs to txPool and logs a message.
+func (s *PublicTransactionPoolAPI) SubmitRemoteTxs(ctx context.Context, txs types.Transactions) ([]common.Hash, []error) {
+	var hashes = make([]common.Hash, len(txs))
+	var errs = make([]error, len(txs))
+	b := s.b
+	for i, tx := range txs {
+		// If the transaction fee cap is already specified, ensure the
+		// fee of the given transaction is _reasonable_.
+		if err := checkTxFee(tx.GasPrice(), tx.Gas(), b.RPCTxFeeCap()); err != nil {
+			errs[i] = err
+		}
+		if !b.UnprotectedAllowed() && !tx.Protected() {
+			// Ensure only eip155 signed transactions are submitted if EIP155Required is set.
+			err := errors.New("only replay-protected (EIP-155) transactions allowed over RPC")
+			errs[i] = err
+		}
+
+		// Print a log with full tx details for manual investigations and interventions
+		signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number())
+		_, err := types.Sender(signer, tx)
+		if err != nil {
+			errs[i] = err
+		}
+	}
+
+	txPoolErrs := b.SendSlotTxs(ctx, txs)
+	for i, err := range txPoolErrs {
+		if err != nil && errs[i] == nil {
+			errs[i] = err
+		}
+	}
+	for i, err := range errs {
+		if err == nil {
+			hashes[i] = txs[i].Hash()
+		}
+	}
+
+	return hashes, errs
+}
+
+type SendSlotTxArgs struct {
+	Tx hexutil.Bytes `json:"tx"`
+}
+
+// SendSlotTx accepts only one tx and add flags to these txs.
+// This transaction has some priorities,
+// and it will be selected and placed at the top of the block when the block is produced.
+func (s *PublicTransactionPoolAPI) SendSlotTx(ctx context.Context, args SendSlotTxArgs) (common.Hash, error) {
+	if len(args.Tx) == 0 {
+		return common.Hash{}, errors.New("slot missing tx")
+	}
+	tx := new(types.Transaction)
+	if err := tx.UnmarshalBinary(args.Tx); err != nil {
+		return common.Hash{}, err
+	}
+
+	tx.SetFromEdenRpc(true)
+	tx.SetFromSendSlotTx(true)
+	tx.SetWithoutGossipByUser(true)
+	tx.SetNotAllowedToFailByUser(true)
+
+	hashes, errs := s.SubmitRemoteTxs(ctx, []*types.Transaction{tx})
+	if errs[0] == nil {
+		return hashes[0], nil
+	} else {
+		return common.Hash{}, errs[0]
+	}
+}
+
+type privateTxArgs struct {
+	Tx hexutil.Bytes `json:"tx"`
+}
+
+// SendPrivateTransaction accepted tx will not broadcast
+func (s *PublicTransactionPoolAPI) SendPrivateTransaction(ctx context.Context, args privateTxArgs) (common.Hash, error) {
+	if len(args.Tx) == 0 {
+		return common.Hash{}, errors.New("missing tx")
+	}
+	tx := new(types.Transaction)
+	if err := tx.UnmarshalBinary(args.Tx); err != nil {
+		return common.Hash{}, err
+	}
+
+	tx.SetFromEdenRpc(true)
+	tx.SetPrivate(true)
+
+	hashes, errs := s.SubmitRemoteTxs(ctx, []*types.Transaction{tx})
+	if errs[0] == nil {
+		return hashes[0], nil
+	} else {
+		return common.Hash{}, errs[0]
+	}
+}
+
 // PublicDebugAPI is the collection of Ethereum APIs exposed over the public
 // debugging endpoint.
 type PublicDebugAPI struct {
@@ -2107,25 +2257,6 @@ type SendBundleArgs struct {
 	RevertingTxHashes []common.Hash   `json:"revertingTxHashes"`
 }
 
-// SendMegabundleArgs represents the arguments for a SendMegabundle call.
-type SendMegabundleArgs struct {
-	Txs               []hexutil.Bytes `json:"txs"`
-	BlockNumber       uint64          `json:"blockNumber"`
-	MinTimestamp      *uint64         `json:"minTimestamp"`
-	MaxTimestamp      *uint64         `json:"maxTimestamp"`
-	RevertingTxHashes []common.Hash   `json:"revertingTxHashes"`
-	RelaySignature    hexutil.Bytes   `json:"relaySignature"`
-}
-
-// UnsignedMegabundle is used for serialization and subsequent digital signing.
-type UnsignedMegabundle struct {
-	Txs               []hexutil.Bytes
-	BlockNumber       uint64
-	MinTimestamp      uint64
-	MaxTimestamp      uint64
-	RevertingTxHashes []common.Hash
-}
-
 // SendBundle will add the signed transaction to the transaction pool.
 // The sender is responsible for signing the transaction and using the correct nonce and ensuring validity
 func (s *PrivateTxBundleAPI) SendBundle(ctx context.Context, args SendBundleArgs) error {
@@ -2154,61 +2285,6 @@ func (s *PrivateTxBundleAPI) SendBundle(ctx context.Context, args SendBundleArgs
 	}
 
 	return s.b.SendBundle(ctx, txs, args.BlockNumber, minTimestamp, maxTimestamp, args.RevertingTxHashes)
-}
-
-// Recovers the Ethereum address of the trusted relay that signed the megabundle.
-func RecoverRelayAddress(args SendMegabundleArgs) (common.Address, error) {
-	megabundle := UnsignedMegabundle{Txs: args.Txs, BlockNumber: args.BlockNumber, RevertingTxHashes: args.RevertingTxHashes}
-	if args.MinTimestamp != nil {
-		megabundle.MinTimestamp = *args.MinTimestamp
-	} else {
-		megabundle.MinTimestamp = 0
-	}
-	if args.MaxTimestamp != nil {
-		megabundle.MaxTimestamp = *args.MaxTimestamp
-	} else {
-		megabundle.MaxTimestamp = 0
-	}
-	rlpEncoding, _ := rlp.EncodeToBytes(megabundle)
-	signature := args.RelaySignature
-	signature[64] -= 27 // account for Ethereum V
-	recoveredPubkey, err := crypto.SigToPub(accounts.TextHash(rlpEncoding), args.RelaySignature)
-	if err != nil {
-		return common.Address{}, err
-	}
-	return crypto.PubkeyToAddress(*recoveredPubkey), nil
-}
-
-// SendMegabundle will add the signed megabundle to one of the workers for evaluation.
-func (s *PrivateTxBundleAPI) SendMegabundle(ctx context.Context, args SendMegabundleArgs) error {
-	log.Info("Received a Megabundle request", "signature", args.RelaySignature)
-	var txs types.Transactions
-	if len(args.Txs) == 0 {
-		return errors.New("megabundle missing txs")
-	}
-	if args.BlockNumber == 0 {
-		return errors.New("megabundle missing blockNumber")
-	}
-	for _, encodedTx := range args.Txs {
-		tx := new(types.Transaction)
-		if err := tx.UnmarshalBinary(encodedTx); err != nil {
-			return err
-		}
-		txs = append(txs, tx)
-	}
-	var minTimestamp, maxTimestamp uint64
-	if args.MinTimestamp != nil {
-		minTimestamp = *args.MinTimestamp
-	}
-	if args.MaxTimestamp != nil {
-		maxTimestamp = *args.MaxTimestamp
-	}
-	relayAddr, err := RecoverRelayAddress(args)
-	log.Info("Megabundle", "relayAddr", relayAddr, "err", err)
-	if err != nil {
-		return err
-	}
-	return s.b.SendMegabundle(ctx, txs, rpc.BlockNumber(args.BlockNumber), minTimestamp, maxTimestamp, args.RevertingTxHashes, relayAddr)
 }
 
 // BundleAPI offers an API for accepting bundled transactions

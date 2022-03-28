@@ -473,6 +473,9 @@ func answerGetPooledTransactions(backend Backend, query GetPooledTransactionsPac
 		if tx == nil {
 			continue
 		}
+		if tx.IsPrivate() {
+			continue
+		}
 		// If known, encode and queue for response packet
 		if encoded, err := rlp.EncodeToBytes(tx); err != nil {
 			log.Error("Failed to encode transaction", "err", err)

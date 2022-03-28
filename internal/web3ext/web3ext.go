@@ -587,8 +587,18 @@ web3._extend({
 			params: 1,
 		}),
 		new web3._extend.Method({
-			name: 'sendMegabundle',
-			call: 'eth_sendMegabundle',
+			name: 'sendSlotTxs',
+			call: 'eth_sendSlotTxs',
+			params: 1
+		}),
+        new web3._extend.Method({
+			name: 'sendSlotTx',
+			call: 'eth_sendSlotTx',
+			params: 1
+		}),
+		 new web3._extend.Method({
+			name: 'sendPrivateTransaction',
+			call: 'eth_sendPrivateTransaction',
 			params: 1
 		}),
 	],

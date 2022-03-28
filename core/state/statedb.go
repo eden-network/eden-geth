@@ -187,6 +187,10 @@ func (s *StateDB) Error() error {
 	return s.dbErr
 }
 
+func (s *StateDB) Root() common.Hash {
+	return s.originalRoot
+}
+
 func (s *StateDB) AddLog(log *types.Log) {
 	s.journal.append(addLogChange{txhash: s.thash})
 

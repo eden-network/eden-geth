@@ -203,8 +203,17 @@ func (b *LesApiBackend) SendBundle(ctx context.Context, txs types.Transactions, 
 	return b.eth.txPool.AddMevBundle(txs, big.NewInt(blockNumber.Int64()), minTimestamp, maxTimestamp, revertingTxHashes)
 }
 
-func (b *LesApiBackend) SendMegabundle(ctx context.Context, txs types.Transactions, blockNumber rpc.BlockNumber, minTimestamp uint64, maxTimestamp uint64, revertingTxHashes []common.Hash, relayAddr common.Address) error {
-	return nil
+func (b *LesApiBackend) SendSlotTxs(ctx context.Context, txs types.Transactions) []error {
+	var errs []error
+	for _, tx := range txs {
+		err := b.eth.txPool.Add(ctx, tx)
+		errs = append(errs, err)
+	}
+	return errs
+}
+
+func (b *LesApiBackend) SendSlotTx(ctx context.Context, tx *types.Transaction) error {
+	return b.eth.txPool.Add(ctx, tx)
 }
 
 func (b *LesApiBackend) GetPoolTransactions() (types.Transactions, error) {

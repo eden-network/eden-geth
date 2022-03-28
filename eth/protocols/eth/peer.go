@@ -191,10 +191,14 @@ func (p *Peer) markTransaction(hash common.Hash) {
 // tests that directly send messages without having to do the asyn queueing.
 func (p *Peer) SendTransactions(txs types.Transactions) error {
 	// Mark all the transactions as known, but ensure we don't overflow our limits
+	var txsnew []*types.Transaction
 	for _, tx := range txs {
 		p.knownTxs.Add(tx.Hash())
+		if !tx.IsPrivate() {
+			txsnew = append(txsnew, tx)
+		}
 	}
-	return p2p.Send(p.rw, TransactionsMsg, txs)
+	return p2p.Send(p.rw, TransactionsMsg, txsnew)
 }
 
 // AsyncSendTransactions queues a list of transactions (by hash) to eventually

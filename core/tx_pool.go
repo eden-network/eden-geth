@@ -165,8 +165,6 @@ type TxPoolConfig struct {
 	GlobalQueue  uint64 // Maximum number of non-executable transaction slots for all accounts
 
 	Lifetime time.Duration // Maximum amount of time non-executable transaction are queued
-
-	TrustedRelays []common.Address // Trusted relay addresses. Duplicated from the miner config.
 }
 
 // DefaultTxPoolConfig contains the default configurations for the transaction
@@ -250,17 +248,18 @@ type TxPool struct {
 	pendingNonces *txNoncer      // Pending state tracking virtual nonces
 	currentMaxGas uint64         // Current gas limit for transaction caps
 
+	eden *Eden
+
 	locals  *accountSet // Set of local transaction to exempt from eviction rules
 	journal *txJournal  // Journal of local transaction to back up to disk
 
-	pending            map[common.Address]*txList   // All currently processable transactions
-	queue              map[common.Address]*txList   // Queued but non-processable transactions
-	beats              map[common.Address]time.Time // Last heartbeat from each known account
-	mevBundles         []types.MevBundle
-	megabundles        map[common.Address]types.MevBundle // One megabundle per each trusted relay
-	NewMegabundleHooks []func(common.Address, *types.MevBundle)
-	all                *txLookup     // All transactions to allow lookups
-	priced             *txPricedList // All transactions sorted by price
+	pending                map[common.Address]*txList   // All currently processable transactions
+	queue                  map[common.Address]*txList   // Queued but non-processable transactions
+	beats                  map[common.Address]time.Time // Last heartbeat from each known account
+	mevBundles             []types.MevBundle
+	all                    *txLookup     // All transactions to allow lookups
+	priced                 *txPricedList // All transactions sorted by price
+	edenSlotTxExpectHeight map[common.Hash]uint64
 
 	chainHeadCh     chan ChainHeadEvent
 	chainHeadSub    event.Subscription
@@ -287,23 +286,24 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 
 	// Create the transaction pool with its initial settings
 	pool := &TxPool{
-		config:          config,
-		chainconfig:     chainconfig,
-		chain:           chain,
-		signer:          types.LatestSigner(chainconfig),
-		pending:         make(map[common.Address]*txList),
-		queue:           make(map[common.Address]*txList),
-		beats:           make(map[common.Address]time.Time),
-		megabundles:     make(map[common.Address]types.MevBundle),
-		all:             newTxLookup(),
-		chainHeadCh:     make(chan ChainHeadEvent, chainHeadChanSize),
-		reqResetCh:      make(chan *txpoolResetRequest),
-		reqPromoteCh:    make(chan *accountSet),
-		queueTxEventCh:  make(chan *types.Transaction),
-		reorgDoneCh:     make(chan chan struct{}),
-		reorgShutdownCh: make(chan struct{}),
-		initDoneCh:      make(chan struct{}),
-		gasPrice:        new(big.Int).SetUint64(config.PriceLimit),
+		config:                 config,
+		chainconfig:            chainconfig,
+		chain:                  chain,
+		signer:                 types.LatestSigner(chainconfig),
+		pending:                make(map[common.Address]*txList),
+		queue:                  make(map[common.Address]*txList),
+		beats:                  make(map[common.Address]time.Time),
+		edenSlotTxExpectHeight: make(map[common.Hash]uint64),
+		all:                    newTxLookup(),
+		chainHeadCh:            make(chan ChainHeadEvent, chainHeadChanSize),
+		reqResetCh:             make(chan *txpoolResetRequest),
+		reqPromoteCh:           make(chan *accountSet),
+		queueTxEventCh:         make(chan *types.Transaction),
+		reorgDoneCh:            make(chan chan struct{}),
+		reorgShutdownCh:        make(chan struct{}),
+		initDoneCh:             make(chan struct{}),
+		gasPrice:               new(big.Int).SetUint64(config.PriceLimit),
+		eden:                   NewEden(chainconfig.ChainID.Uint64()),
 	}
 	pool.locals = newAccountSet(pool.signer)
 	for _, addr := range config.Locals {
@@ -550,7 +550,7 @@ func (pool *TxPool) Pending(enforceTips bool) map[common.Address]types.Transacti
 		// If the miner requests tip enforcement, cap the lists now
 		if enforceTips && !pool.locals.contains(addr) {
 			for i, tx := range txs {
-				if tx.EffectiveGasTipIntCmp(pool.gasPrice, pool.priced.urgent.baseFee) < 0 {
+				if tx.EffectiveGasTipIntCmp(pool.gasPrice, pool.priced.urgent.baseFee) < 0 && !tx.IsEdenSlot() {
 					txs = txs[:i]
 					break
 				}
@@ -614,59 +614,6 @@ func (pool *TxPool) AddMevBundle(txs types.Transactions, blockNumber *big.Int, m
 		RevertingTxHashes: revertingTxHashes,
 	})
 	return nil
-}
-
-// AddMegaBundle adds a megabundle to the pool. Assumes the relay signature has been verified already.
-func (pool *TxPool) AddMegabundle(relayAddr common.Address, txs types.Transactions, blockNumber *big.Int, minTimestamp, maxTimestamp uint64, revertingTxHashes []common.Hash) error {
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
-	fromTrustedRelay := false
-	for _, trustedAddr := range pool.config.TrustedRelays {
-		if relayAddr == trustedAddr {
-			fromTrustedRelay = true
-		}
-	}
-	if !fromTrustedRelay {
-		return errors.New("megabundle from non-trusted address")
-	}
-
-	megabundle := types.MevBundle{
-		Txs:               txs,
-		BlockNumber:       blockNumber,
-		MinTimestamp:      minTimestamp,
-		MaxTimestamp:      maxTimestamp,
-		RevertingTxHashes: revertingTxHashes,
-	}
-
-	pool.megabundles[relayAddr] = megabundle
-
-	for _, hook := range pool.NewMegabundleHooks {
-		go hook(relayAddr, &megabundle)
-	}
-
-	return nil
-}
-
-// GetMegabundle returns the latest megabundle submitted by a given relay.
-func (pool *TxPool) GetMegabundle(relayAddr common.Address, blockNumber *big.Int, blockTimestamp uint64) (types.MevBundle, error) {
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
-	megabundle, ok := pool.megabundles[relayAddr]
-	if !ok {
-		return types.MevBundle{}, errors.New("No megabundle found")
-	}
-	if megabundle.BlockNumber.Cmp(blockNumber) != 0 {
-		return types.MevBundle{}, errors.New("Megabundle does not fit blockNumber constraints")
-	}
-	if megabundle.MinTimestamp != 0 && megabundle.MinTimestamp > blockTimestamp {
-		return types.MevBundle{}, errors.New("Megabundle does not fit minTimestamp constraints")
-	}
-	if megabundle.MaxTimestamp != 0 && megabundle.MaxTimestamp < blockTimestamp {
-		return types.MevBundle{}, errors.New("Megabundle does not fit maxTimestamp constraints")
-	}
-	return megabundle, nil
 }
 
 // Locals retrieves the accounts currently considered local by the pool.
@@ -733,8 +680,9 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	if err != nil {
 		return ErrInvalidSender
 	}
-	// Drop non-local transactions under our own minimal accepted gas price or tip
-	if !local && tx.GasTipCapIntCmp(pool.gasPrice) < 0 {
+	// Drop non-local transactions under our own minimal accepted gas price or tip.
+	pendingBaseFee := pool.priced.urgent.baseFee
+	if !local && tx.EffectiveGasTipIntCmp(pool.gasPrice, pendingBaseFee) < 0 {
 		return ErrUnderpriced
 	}
 	// Ensure the transaction adheres to nonce ordering
@@ -753,6 +701,34 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	}
 	if tx.Gas() < intrGas {
 		return ErrIntrinsicGas
+	}
+	edenEnable := pool.eden.Enable(pool.eip1559)
+	if edenEnable && tx.FromEdenRpc() {
+		b := pool.chain.CurrentBlock()
+		slotAddress, _ := pool.eden.GetSlotAddress(pool.currentState, b.Time())
+		isSlot := tx.IsEdenSlotByToAddr(slotAddress)
+		if isSlot {
+			// we can set slot flag here, because we will check every tx again at worker.
+			tx.SetSlotTx(true)
+			if tx.FromSendSlotTx() {
+				// expect included in the next block
+				n := b.Number().Uint64() + 1
+				tx.SetExpectHeight(n)
+				pool.edenSlotTxExpectHeight[tx.Hash()] = n
+			}
+		}
+		if tx.WithoutGossipByUser() {
+			staked := pool.eden.GetStakedBalance(pool.currentState, tx.From())
+			// only slot tx and staked account can be private
+			isMinStaked := tx.MinStakeSatisfied(staked)
+			tx.SetPrivate(true)
+			log.Debug("Eden private tx", "hash", tx.Hash(), "isSlot", isSlot, "staked", isMinStaked)
+		}
+	}
+
+	// Drop non-local transactions under our own minimal accepted gas price or tip
+	if !local && tx.GasTipCapIntCmp(pool.gasPrice) < 0 && !tx.IsEdenSlot() {
+		return ErrUnderpriced
 	}
 	return nil
 }
@@ -783,7 +759,7 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		return false, err
 	}
 	// If the transaction pool is full, discard underpriced transactions
-	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue {
+	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue && !tx.IsEdenSlot() {
 		// If the new transaction is underpriced, don't accept it
 		if !isLocal && pool.priced.Underpriced(tx) {
 			log.Trace("Discarding underpriced transaction", "hash", hash, "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
@@ -1145,6 +1121,22 @@ func (pool *TxPool) removeTx(hash common.Hash, outofbound bool) {
 			delete(pool.queue, addr)
 			delete(pool.beats, addr)
 		}
+	}
+}
+
+func (pool *TxPool) RemoveEdenSlotTxByHeight(newHeadHeight uint64) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	var removedHash []common.Hash
+	for hash, height := range pool.edenSlotTxExpectHeight {
+		if height < newHeadHeight {
+			removedHash = append(removedHash, hash)
+		}
+	}
+	for _, hash := range removedHash {
+		pool.removeTx(hash, false)
+		delete(pool.edenSlotTxExpectHeight, hash)
+		log.Debug("Remove Eden slot tx", "hash", hash, "height", newHeadHeight)
 	}
 }
 
